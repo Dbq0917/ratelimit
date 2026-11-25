@@ -39,6 +39,23 @@ func main() {
 }
 ```
 
+## Per-key rate limiting
+
+`NewKeyed` creates a limiter with an independent bucket for every key. This
+prevents one noisy tenant from consuming capacity belonging to other tenants.
+Idle keys are reclaimed automatically; the TTL can be changed with
+`WithKeyTTL`.
+
+```go
+rl := ratelimit.NewKeyed(100, ratelimit.WithKeyTTL(10*time.Minute))
+
+rl.Take("tenant-a")
+rl.Take("tenant-b")
+```
+
+Each key gets its own rate and slack, and keys only contend within the same
+hash shard rather than through a process-wide lock.
+
 ## FAQ:
 - What's the major diff v.s. https://pkg.go.dev/golang.org/x/time/rate? (based on #77)
 

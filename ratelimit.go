@@ -47,9 +47,11 @@ type Clock interface {
 
 // config configures a limiter.
 type config struct {
-	clock Clock
-	slack int
-	per   time.Duration
+	clock     Clock
+	slack     int
+	per       time.Duration
+	keyTTL    time.Duration
+	keyShards int
 }
 
 // New returns a Limiter that will limit to the given RPS.
@@ -60,9 +62,11 @@ func New(rate int, opts ...Option) Limiter {
 // buildConfig combines defaults with options.
 func buildConfig(opts []Option) config {
 	c := config{
-		clock: clock.New(),
-		slack: 10,
-		per:   time.Second,
+		clock:     clock.New(),
+		slack:     10,
+		per:       time.Second,
+		keyTTL:    10 * time.Minute,
+		keyShards: 64,
 	}
 
 	for _, opt := range opts {
@@ -121,6 +125,32 @@ func (p perOption) apply(c *config) {
 // New(2, Per(60*time.Second)) creates a 2 per minute rate limiter.
 func Per(per time.Duration) Option {
 	return perOption(per)
+}
+
+type keyTTLOption time.Duration
+
+func (o keyTTLOption) apply(c *config) {
+	c.keyTTL = time.Duration(o)
+}
+
+// WithKeyTTL configures how long an idle key is retained by a KeyedLimiter.
+// Keys idle for longer than the TTL may be reclaimed. A non-positive TTL
+// disables automatic key reclamation. The effective TTL is never shorter than
+// one request interval, so reclaiming a key cannot reset its bucket early.
+func WithKeyTTL(ttl time.Duration) Option {
+	return keyTTLOption(ttl)
+}
+
+type keyShardsOption int
+
+func (o keyShardsOption) apply(c *config) {
+	c.keyShards = int(o)
+}
+
+// WithKeyShards configures the number of independently locked shards used by
+// a KeyedLimiter. More shards reduce contention between different keys.
+func WithKeyShards(shards int) Option {
+	return keyShardsOption(shards)
 }
 
 type unlimited struct{}
