@@ -66,45 +66,38 @@ func newAtomicBased(rate int, opts ...Option) *atomicLimiter {
 // Take blocks to ensure that the time spent between multiple
 // Take calls is on average per/rate.
 func (t *atomicLimiter) Take() time.Time {
-	var (
-		newState state
-		taken    bool
-		interval time.Duration
-	)
-	for !taken {
+	for {
 		now := t.clock.Now()
 
 		previousStatePointer := atomic.LoadPointer(&t.state)
 		oldState := (*state)(previousStatePointer)
 
-		newState = state{
+		newState := state{
 			last:     now,
 			sleepFor: oldState.sleepFor,
 		}
 
-		// If this is our first request, then we allow it.
-		if oldState.last.IsZero() {
-			taken = atomic.CompareAndSwapPointer(&t.state, previousStatePointer, unsafe.Pointer(&newState))
-			continue
+		if !oldState.last.IsZero() {
+			// sleepFor calculates how much time we should sleep based on
+			// the perRequest budget and how long the last request took.
+			// Since the request may take longer than the budget, this number
+			// can get negative, and is summed across requests.
+			newState.sleepFor += t.perRequest - now.Sub(oldState.last)
+			// We shouldn't allow sleepFor to get too negative, since it would mean that
+			// a service that slowed down a lot for a short period of time would get
+			// a much higher RPS following that.
+			if newState.sleepFor < t.maxSlack {
+				newState.sleepFor = t.maxSlack
+			}
+			if newState.sleepFor > 0 {
+				newState.last = now.Add(newState.sleepFor)
+				newState.sleepFor = 0
+			}
 		}
 
-		// sleepFor calculates how much time we should sleep based on
-		// the perRequest budget and how long the last request took.
-		// Since the request may take longer than the budget, this number
-		// can get negative, and is summed across requests.
-		newState.sleepFor += t.perRequest - now.Sub(oldState.last)
-		// We shouldn't allow sleepFor to get too negative, since it would mean that
-		// a service that slowed down a lot for a short period of time would get
-		// a much higher RPS following that.
-		if newState.sleepFor < t.maxSlack {
-			newState.sleepFor = t.maxSlack
+		if atomic.CompareAndSwapPointer(&t.state, previousStatePointer, unsafe.Pointer(&newState)) {
+			t.clock.Sleep(newState.last.Sub(now))
+			return newState.last
 		}
-		if newState.sleepFor > 0 {
-			newState.last = newState.last.Add(newState.sleepFor)
-			interval, newState.sleepFor = newState.sleepFor, 0
-		}
-		taken = atomic.CompareAndSwapPointer(&t.state, previousStatePointer, unsafe.Pointer(&newState))
 	}
-	t.clock.Sleep(interval)
-	return newState.last
 }
