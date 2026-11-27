@@ -21,6 +21,7 @@
 package ratelimit // import "go.uber.org/ratelimit"
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -85,4 +86,64 @@ func (t *mutexLimiter) Take() time.Time {
 	}
 
 	return t.last
+}
+
+// TakeContext blocks to ensure that the time spent between multiple Take calls
+// is on average per/rate, unless ctx is canceled. A canceled call returns
+// immediately with the context error and rolls back the budget it had
+// reserved, so it does not consume any permission or delay later callers.
+func (t *mutexLimiter) TakeContext(ctx context.Context) (time.Time, error) {
+	t.Lock()
+	defer t.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+
+	now := t.clock.Now()
+
+	// If this is our first request, then we allow it.
+	if t.last.IsZero() {
+		t.last = now
+		return t.last, nil
+	}
+
+	// sleepFor calculates how much time we should sleep based on
+	// the perRequest budget and how long the last request took.
+	// Since the request may take longer than the budget, this number
+	// can get negative, and is summed across requests.
+	t.sleepFor += t.perRequest - now.Sub(t.last)
+
+	// We shouldn't allow sleepFor to get too negative, since it would mean that
+	// a service that slowed down a lot for a short period of time would get
+	// a much higher RPS following that.
+	if t.sleepFor < t.maxSlack {
+		t.sleepFor = t.maxSlack
+	}
+
+	// If sleepFor is not positive, there is budget available right away and
+	// nothing is reserved: just advance last like Take does.
+	if t.sleepFor <= 0 {
+		t.last = now
+		return t.last, nil
+	}
+
+	// Reserve the permission while we wait. On cancellation, undo the
+	// reservation so the canceled request leaves no trace in the state.
+	entryLast := t.last
+	sleepFor := t.sleepFor
+	issueTime := now.Add(sleepFor)
+	t.last = issueTime
+	t.sleepFor = 0
+
+	if err := sleepContext(ctx, t.clock, sleepFor); err != nil {
+		// Rewind to the state on entry: the reservation never happened. The
+		// accumulated sleepFor is dropped because it was derived from this
+		// canceled request; keeping it would charge the next caller twice.
+		t.last = entryLast
+		t.sleepFor = 0
+		return time.Time{}, err
+	}
+
+	return issueTime, nil
 }

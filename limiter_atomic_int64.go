@@ -21,6 +21,7 @@
 package ratelimit // import "go.uber.org/ratelimit"
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -56,13 +57,44 @@ func newAtomicInt64Based(rate int, opts ...Option) *atomicInt64Limiter {
 // Take blocks to ensure that the time spent between multiple
 // Take calls is on average time.Second/rate.
 func (t *atomicInt64Limiter) Take() time.Time {
-	var (
-		newTimeOfNextPermissionIssue int64
-		now                          int64
-	)
+	newTimeOfNextPermissionIssue, now, _ := t.reserve()
+	sleepDuration := time.Duration(newTimeOfNextPermissionIssue - now)
+	if sleepDuration > 0 {
+		t.clock.Sleep(sleepDuration)
+		return time.Unix(0, newTimeOfNextPermissionIssue)
+	}
+	// return now if we don't sleep as atomicLimiter does
+	return time.Unix(0, now)
+}
+
+// TakeContext blocks to ensure that the RPS is met, unless ctx is canceled.
+// A canceled call returns immediately with the context error and removes the
+// permission it had reserved, so it consumes no budget and does not make
+// later callers wait an extra round.
+func (t *atomicInt64Limiter) TakeContext(ctx context.Context) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+
+	newTimeOfNextPermissionIssue, now, previousTimeOfNextPermissionIssue := t.reserve()
+	sleepDuration := time.Duration(newTimeOfNextPermissionIssue - now)
+	if sleepDuration <= 0 {
+		return time.Unix(0, now), nil
+	}
+
+	if err := sleepContext(ctx, t.clock, sleepDuration); err != nil {
+		t.rollback(previousTimeOfNextPermissionIssue, newTimeOfNextPermissionIssue)
+		return time.Time{}, err
+	}
+	return time.Unix(0, newTimeOfNextPermissionIssue), nil
+}
+
+// reserve claims the next permission, returning the issue time of that
+// permission and the time at which the reservation happened.
+func (t *atomicInt64Limiter) reserve() (newTimeOfNextPermissionIssue int64, now int64, timeOfNextPermissionIssue int64) {
 	for {
 		now = t.clock.Now().UnixNano()
-		timeOfNextPermissionIssue := atomic.LoadInt64(&t.state)
+		timeOfNextPermissionIssue = atomic.LoadInt64(&t.state)
 
 		switch {
 		case timeOfNextPermissionIssue == 0 || (t.maxSlack == 0 && now-timeOfNextPermissionIssue > int64(t.perRequest)):
@@ -78,15 +110,14 @@ func (t *atomicInt64Limiter) Take() time.Time {
 		}
 
 		if atomic.CompareAndSwapInt64(&t.state, timeOfNextPermissionIssue, newTimeOfNextPermissionIssue) {
-			break
+			return newTimeOfNextPermissionIssue, now, timeOfNextPermissionIssue
 		}
 	}
+}
 
-	sleepDuration := time.Duration(newTimeOfNextPermissionIssue - now)
-	if sleepDuration > 0 {
-		t.clock.Sleep(sleepDuration)
-		return time.Unix(0, newTimeOfNextPermissionIssue)
-	}
-	// return now if we don't sleep as atomicLimiter does
-	return time.Unix(0, now)
+// rollback restores the previous issue time if it is still the value that
+// reserve installed. If other goroutines have already moved the state forward,
+// the state is left untouched rather than corrupting their reservations.
+func (t *atomicInt64Limiter) rollback(previousTimeOfNextPermissionIssue, newTimeOfNextPermissionIssue int64) {
+	atomic.CompareAndSwapInt64(&t.state, newTimeOfNextPermissionIssue, previousTimeOfNextPermissionIssue)
 }

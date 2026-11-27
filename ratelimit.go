@@ -21,6 +21,7 @@
 package ratelimit // import "go.uber.org/ratelimit"
 
 import (
+	"context"
 	"time"
 
 	"github.com/benbjohnson/clock"
@@ -35,6 +36,12 @@ import (
 type Limiter interface {
 	// Take should block to make sure that the RPS is met.
 	Take() time.Time
+
+	// TakeContext blocks to make sure that the RPS is met, unless ctx is
+	// canceled first. On cancellation it returns immediately with the context
+	// error without consuming any of the rate limit budget: no permission is
+	// reserved, so later callers are not delayed by the canceled request.
+	TakeContext(ctx context.Context) (time.Time, error)
 }
 
 // Clock is the minimum necessary interface to instantiate a rate limiter with
@@ -43,6 +50,43 @@ type Limiter interface {
 type Clock interface {
 	Now() time.Time
 	Sleep(time.Duration)
+}
+
+// afterClock is an optional capability of a Clock. The real clock and the
+// benbjohnson mock clock both implement After, which lets a wait be driven by
+// the (possibly mock) clock while remaining interruptible by a context.
+type afterClock interface {
+	After(time.Duration) <-chan time.Time
+}
+
+// sleepContext waits for d on the given clock, or until ctx is canceled.
+// It returns nil when the full duration elapsed and the context error
+// otherwise. No timer is created when there is nothing to wait for, so the
+// non-sleeping hot path stays allocation free.
+func sleepContext(ctx context.Context, c Clock, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if ac, ok := c.(afterClock); ok {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ac.After(d):
+			return nil
+		}
+	}
+
+	// Fall back to an uninterruptible sleep for Clock implementations that do
+	// not expose After. The context is still observed once the sleep returns.
+	c.Sleep(d)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // config configures a limiter.
@@ -132,4 +176,11 @@ func NewUnlimited() Limiter {
 
 func (unlimited) Take() time.Time {
 	return time.Now()
+}
+
+func (unlimited) TakeContext(ctx context.Context) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	return time.Now(), nil
 }

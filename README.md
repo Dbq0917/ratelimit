@@ -39,6 +39,30 @@ func main() {
 }
 ```
 
+## Cancellation
+
+`Take()` blocks with no way to back out, which can delay service shutdown or
+waste time when a caller's deadline has already passed. Use `TakeContext()` to
+wait while honoring a `context.Context`:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+defer cancel()
+
+if _, err := rl.TakeContext(ctx); err != nil {
+    // ctx was canceled (or timed out) before a permission was granted.
+    return err
+}
+// A permission was granted; proceed with the rate-limited operation.
+```
+
+When the context is canceled while waiting, `TakeContext` returns immediately
+with the context error and releases the permission it had reserved, so the
+canceled request consumes no budget and does not make later callers wait an
+extra round. The non-blocking hot path adds no extra work: a call that does not
+need to sleep behaves exactly like `Take()`, with no additional allocation or
+system call.
+
 ## FAQ:
 - What's the major diff v.s. https://pkg.go.dev/golang.org/x/time/rate? (based on #77)
 

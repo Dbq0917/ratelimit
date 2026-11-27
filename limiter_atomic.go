@@ -21,6 +21,7 @@
 package ratelimit // import "go.uber.org/ratelimit"
 
 import (
+	"context"
 	"time"
 
 	"sync/atomic"
@@ -66,10 +67,41 @@ func newAtomicBased(rate int, opts ...Option) *atomicLimiter {
 // Take blocks to ensure that the time spent between multiple
 // Take calls is on average per/rate.
 func (t *atomicLimiter) Take() time.Time {
+	newState, _, interval := t.reserve()
+	t.clock.Sleep(interval)
+	return newState.last
+}
+
+// TakeContext blocks to ensure that the RPS is met, unless ctx is canceled.
+// A canceled call returns immediately with the context error and removes the
+// permission it had reserved, so it consumes no budget and does not make
+// later callers wait an extra round.
+func (t *atomicLimiter) TakeContext(ctx context.Context) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+
+	newState, installedPointer, interval := t.reserve()
+	if interval <= 0 {
+		return newState.last, nil
+	}
+
+	if err := sleepContext(ctx, t.clock, interval); err != nil {
+		t.rollback(installedPointer, newState)
+		return time.Time{}, err
+	}
+	return newState.last, nil
+}
+
+// reserve claims the next permission, returning the resulting state, the
+// pointer actually installed in the state (needed to roll back) and how long
+// to sleep.
+func (t *atomicLimiter) reserve() (state, unsafe.Pointer, time.Duration) {
 	var (
-		newState state
-		taken    bool
-		interval time.Duration
+		newState         state
+		taken            bool
+		interval         time.Duration
+		installedPointer unsafe.Pointer
 	)
 	for !taken {
 		now := t.clock.Now()
@@ -103,8 +135,22 @@ func (t *atomicLimiter) Take() time.Time {
 			newState.last = newState.last.Add(newState.sleepFor)
 			interval, newState.sleepFor = newState.sleepFor, 0
 		}
-		taken = atomic.CompareAndSwapPointer(&t.state, previousStatePointer, unsafe.Pointer(&newState))
+		installedPointer = unsafe.Pointer(&newState)
+		taken = atomic.CompareAndSwapPointer(&t.state, previousStatePointer, installedPointer)
 	}
-	t.clock.Sleep(interval)
-	return newState.last
+	return newState, installedPointer, interval
+}
+
+// rollback cancels the reservation installed by reserve if it is still the
+// current state. The state is rewound to "a permission was just issued", using
+// the scheduled issue time of the canceled permission as the reference point,
+// so the next caller reuses that exact slot rather than waiting an additional
+// interval. If other goroutines already moved the state forward, it is left
+// untouched to avoid corrupting their reservations.
+func (t *atomicLimiter) rollback(installedPointer unsafe.Pointer, newState state) {
+	rolledBack := state{
+		last:     newState.last,
+		sleepFor: 0,
+	}
+	atomic.CompareAndSwapPointer(&t.state, installedPointer, unsafe.Pointer(&rolledBack))
 }
